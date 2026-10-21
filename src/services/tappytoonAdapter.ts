@@ -1,4 +1,5 @@
 import { ParsedTappytoonUrl, formatSeriesTitle } from './tappytoonUrl';
+import { TappytoonAuthService } from './tappytoonAuth';
 
 export interface EpisodeMetadata {
   seriesTitle: string;
@@ -10,6 +11,8 @@ export interface EpisodeMetadata {
   estimatedImageCount?: number;
   imageUrls?: string[];
   extractionNote?: string;
+  comicId?: number;
+  chapterId?: number;
 }
 
 export interface ExtractionResult {
@@ -19,104 +22,351 @@ export interface ExtractionResult {
   errorMessage?: string;
 }
 
+const API_BASE = 'https://api-global.tappytoon.com';
+
 export class TappytoonAdapter {
-  static async fetchMetadata(parsed: ParsedTappytoonUrl): Promise<EpisodeMetadata> {
+  /**
+   * Fetches metadata for a Tappytoon episode URL using the Tappytoon REST API.
+   * Leverages user authentication if logged in to access purchased / unlocked episodes.
+   */
+  static async fetchMetadata(
+    parsed: ParsedTappytoonUrl,
+    customToken?: string
+  ): Promise<EpisodeMetadata> {
     if (!parsed.isValid || !parsed.canonicalUrl) {
       throw new Error(parsed.error || 'Invalid URL provided.');
     }
 
-    const seriesTitle = formatSeriesTitle(parsed.seriesSlug);
-    const episodeTitle = parsed.episodeId ? `Episode ${parsed.episodeId}` : 'Episode';
+    const seriesTitleFallback = formatSeriesTitle(parsed.seriesSlug);
+    const episodeTitleFallback = parsed.episodeId ? `Episode ${parsed.episodeId}` : 'Episode';
+    const lang = parsed.language || 'en';
+    const token = customToken ?? TappytoonAuthService.getAccessToken();
+
+    const headers: Record<string, string> = {
+      'Accept': 'application/json',
+    };
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
 
     try {
-      const res = await fetch(parsed.canonicalUrl, { mode: 'cors', credentials: 'omit' }).catch(() => null);
+      let comicId: number | undefined;
+      let seriesTitle = seriesTitleFallback;
+      let comicThumbnail: string | undefined;
 
-      if (!res) {
+      // Step 1: If URL specifies a seriesSlug, search for comicId
+      if (parsed.seriesSlug) {
+        const searchUrl = `${API_BASE}/comics?keyword=${encodeURIComponent(parsed.seriesSlug)}&searchOption=url_slug_like&locale=${lang}`;
+        const searchRes = await fetch(searchUrl, { headers }).catch(() => null);
+
+        if (searchRes) {
+          if (searchRes.status === 401 || searchRes.status === 403) {
+            return {
+              seriesTitle,
+              episodeTitle: episodeTitleFallback,
+              episodeNumber: parsed.episodeId,
+              accessStatus: 'login_required',
+              accessMessage: 'Authentication required. Please log in to your Tappytoon account to view this episode.',
+            };
+          }
+
+          if (searchRes.ok) {
+            const searchData = await searchRes.json();
+            if (Array.isArray(searchData?.result) && searchData.result.length > 0) {
+              comicId = searchData.result[0];
+            }
+          }
+        }
+      }
+
+      // If comicId was found, optionally fetch comic details for title & cover
+      if (comicId) {
+        const comicRes = await fetch(`${API_BASE}/comics/${comicId}?locale=${lang}`, { headers }).catch(() => null);
+        if (comicRes && comicRes.ok) {
+          const comicData = await comicRes.json();
+          if (comicData?.title) {
+            seriesTitle = comicData.title;
+          }
+          if (comicData?.thumbnailUrl) {
+            comicThumbnail = comicData.thumbnailUrl;
+          }
+        }
+      }
+
+      // Step 2: Fetch chapters list
+      let chapters: any[] = [];
+      if (comicId) {
+        const chaptersRes = await fetch(`${API_BASE}/comics/${comicId}/chapters?sort=asc&limit=250&locale=${lang}`, { headers }).catch(() => null);
+
+        if (chaptersRes) {
+          if (chaptersRes.status === 401 || chaptersRes.status === 403) {
+            return {
+              seriesTitle,
+              episodeTitle: episodeTitleFallback,
+              episodeNumber: parsed.episodeId,
+              accessStatus: 'login_required',
+              accessMessage: 'Authentication required. Please log in to your Tappytoon account.',
+            };
+          }
+
+          if (chaptersRes.ok) {
+            chapters = await chaptersRes.json();
+          }
+        }
+      }
+
+      // Step 3: Identify the requested chapter
+      let matchedChapter: any = null;
+      if (parsed.episodeId) {
+        const epStr = String(parsed.episodeId);
+
+        // Try direct chapter ID match
+        matchedChapter = chapters.find((c) => String(c.id) === epStr);
+
+        // Try matching by order or orderInSeason
+        if (!matchedChapter) {
+          matchedChapter = chapters.find(
+            (c) => String(c.order) === epStr || String(c.orderInSeason) === epStr
+          );
+        }
+
+        // Try title match
+        if (!matchedChapter) {
+          matchedChapter = chapters.find((c) =>
+            c.title && (c.title.toLowerCase().includes(`episode ${epStr}`) || c.title.toLowerCase().includes(`chapter ${epStr}`))
+          );
+        }
+
+        // Fallback: 1-based order index
+        if (!matchedChapter && !isNaN(Number(epStr))) {
+          const idx = Number(epStr) - 1;
+          if (idx >= 0 && idx < chapters.length) {
+            matchedChapter = chapters[idx];
+          }
+        }
+      }
+
+      if (!matchedChapter && chapters.length > 0) {
+        matchedChapter = chapters[0];
+      }
+
+      // If chapter direct lookup is available by episodeId when comicId was not resolved
+      if (!matchedChapter && parsed.episodeId) {
+        const chRes = await fetch(`${API_BASE}/chapters/${parsed.episodeId}?locale=${lang}`, { headers }).catch(() => null);
+        if (chRes) {
+          if (chRes.status === 401 || chRes.status === 403) {
+            return {
+              seriesTitle,
+              episodeTitle: episodeTitleFallback,
+              episodeNumber: parsed.episodeId,
+              accessStatus: 'login_required',
+              accessMessage: 'Authentication required. Please log in to your Tappytoon account.',
+            };
+          }
+          if (chRes.ok) {
+            matchedChapter = await chRes.json();
+          }
+        }
+      }
+
+      if (!matchedChapter) {
+        if (!token) {
+          return {
+            seriesTitle,
+            episodeTitle: episodeTitleFallback,
+            episodeNumber: parsed.episodeId,
+            accessStatus: 'login_required',
+            accessMessage: 'Authentication required or episode not found. Please log in to your Tappytoon account.',
+          };
+        }
+        return {
+          seriesTitle,
+          episodeTitle: episodeTitleFallback,
+          episodeNumber: parsed.episodeId,
+          accessStatus: 'purchase_required',
+          accessMessage: 'Episode not found or requires purchase on Tappytoon.',
+        };
+      }
+
+      const chapterId = matchedChapter.id;
+      const episodeTitle = matchedChapter.title || episodeTitleFallback;
+      const thumbnailUrl = matchedChapter.thumbnailUrl || comicThumbnail;
+
+      // Check user access rights
+      const isAccessible = matchedChapter.isAccessible || matchedChapter.isFree || matchedChapter.isUserUnlocked;
+      if (matchedChapter.isAccessible === false && matchedChapter.isFree === false && matchedChapter.isUserUnlocked === false) {
+        if (!token) {
+          return {
+            seriesTitle,
+            episodeTitle,
+            episodeNumber: parsed.episodeId,
+            thumbnailUrl,
+            comicId,
+            chapterId,
+            accessStatus: 'login_required',
+            accessMessage: 'This episode requires user authentication to verify access permissions.',
+          };
+        }
         return {
           seriesTitle,
           episodeTitle,
           episodeNumber: parsed.episodeId,
-          accessStatus: 'restricted_cors',
-          accessMessage: 'Browser CORS restrictions apply. Cross-origin web scraping requires CORS proxy or browser extension / APK wrapper session.',
-          extractionNote: 'Client-side browser security (CORS) prevents direct cross-origin HTML/API reading without user session or proxy wrapper.',
+          thumbnailUrl,
+          comicId,
+          chapterId,
+          accessStatus: 'purchase_required',
+          accessMessage: 'This episode requires purchase or unlock on your Tappytoon account.',
         };
       }
 
-      if (res.status === 401 || res.status === 403) {
+      // Step 4: Retrieve content images
+      let contentData: any = null;
+      const variants = ['high', 'original', 'super_high', 'low'];
+      for (const variant of variants) {
+        const contentRes = await fetch(
+          `${API_BASE}/content-delivery/contents?chapterId=${chapterId}&variant=${variant}`,
+          { headers }
+        ).catch(() => null);
+
+        if (contentRes) {
+          if (contentRes.status === 401 || contentRes.status === 403) {
+            return {
+              seriesTitle,
+              episodeTitle,
+              episodeNumber: parsed.episodeId,
+              thumbnailUrl,
+              comicId,
+              chapterId,
+              accessStatus: 'login_required',
+              accessMessage: 'Session expired or unauthorized. Please log in to your Tappytoon account.',
+            };
+          }
+
+          if (contentRes.ok) {
+            contentData = await contentRes.json();
+            if (Array.isArray(contentData?.media) && contentData.media.length > 0) {
+              break;
+            }
+          }
+        }
+      }
+
+      if (!contentData || !Array.isArray(contentData.media) || contentData.media.length === 0) {
+        if (!isAccessible && !token) {
+          return {
+            seriesTitle,
+            episodeTitle,
+            episodeNumber: parsed.episodeId,
+            thumbnailUrl,
+            comicId,
+            chapterId,
+            accessStatus: 'login_required',
+            accessMessage: 'Please log in to your Tappytoon account to access episode images.',
+          };
+        }
         return {
           seriesTitle,
           episodeTitle,
           episodeNumber: parsed.episodeId,
-          accessStatus: 'login_required',
-          accessMessage: 'Authentication or purchase required to access this episode on Tappytoon.',
+          thumbnailUrl,
+          comicId,
+          chapterId,
+          accessStatus: 'purchase_required',
+          accessMessage: 'Episode images unavailable or account lacks purchase access.',
         };
       }
 
-      if (res.ok) {
-        const text = await res.text();
-        return {
-          seriesTitle,
-          episodeTitle,
-          episodeNumber: parsed.episodeId,
-          accessStatus: 'public',
-          accessMessage: 'Public metadata accessible.',
-          estimatedImageCount: undefined,
-          extractionNote: text.includes('drm') ? 'Episode uses encrypted/protected rendering.' : undefined,
-        };
-      }
+      // Sort media items by sortKey to ensure reading order
+      const sortedMedia = [...contentData.media].sort(
+        (a: any, b: any) => (a.sortKey ?? 0) - (b.sortKey ?? 0)
+      );
+
+      const imageUrls: string[] = sortedMedia
+        .map((m: any) => m.path || m.url)
+        .filter(Boolean);
 
       return {
         seriesTitle,
         episodeTitle,
         episodeNumber: parsed.episodeId,
-        accessStatus: 'restricted_cors',
-        accessMessage: `Tappytoon server returned status ${res.status}.`,
+        thumbnailUrl,
+        comicId,
+        chapterId,
+        accessStatus: 'public',
+        accessMessage: 'Episode accessible.',
+        estimatedImageCount: imageUrls.length,
+        imageUrls,
       };
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       return {
-        seriesTitle,
-        episodeTitle,
+        seriesTitle: seriesTitleFallback,
+        episodeTitle: episodeTitleFallback,
         episodeNumber: parsed.episodeId,
         accessStatus: 'restricted_cors',
-        accessMessage: `Unable to query metadata directly: ${msg}`,
+        accessMessage: `Error querying Tappytoon API: ${msg}`,
       };
     }
   }
 
+  /**
+   * Downloads and extracts image payloads for a Tappytoon episode.
+   * Reports progress percentage through onProgress callback.
+   */
   static async extractImages(
     parsed: ParsedTappytoonUrl,
-    onProgress?: (progressPercent: number) => void
+    onProgress?: (progressPercent: number) => void,
+    customToken?: string
   ): Promise<ExtractionResult> {
-    const metadata = await this.fetchMetadata(parsed);
+    const metadata = await this.fetchMetadata(parsed, customToken);
 
-    if (metadata.accessStatus === 'restricted_cors') {
+    if (metadata.accessStatus === 'login_required') {
       throw new Error(
-        'Cannot extract images directly due to Browser CORS restrictions on tappytoon.com. ' +
-        'To download purchased content, an authenticated CORS proxy or Android Webview/APK wrapper session is required.'
+        'Authentication required to download this episode. Please log in to your Tappytoon account.'
       );
     }
 
-    if (metadata.accessStatus === 'login_required' || metadata.accessStatus === 'purchase_required') {
-      throw new Error('Episode requires login or purchase on Tappytoon. Please authenticate in browser or app.');
+    if (metadata.accessStatus === 'purchase_required') {
+      throw new Error(
+        'This episode requires purchase or unlock on your Tappytoon account before downloading.'
+      );
     }
 
-    const images: { filename: string; blob: Blob; mimeType: string }[] = [];
-    const total = metadata.imageUrls?.length || 0;
+    if (metadata.accessStatus === 'restricted_cors') {
+      throw new Error(metadata.accessMessage || 'Network error accessing Tappytoon API.');
+    }
+
+    const urls = metadata.imageUrls || [];
+    const total = urls.length;
 
     if (total === 0) {
       throw new Error('No accessible images found in this episode payload.');
     }
 
+    const images: { filename: string; blob: Blob; mimeType: string }[] = [];
+
     for (let i = 0; i < total; i++) {
-      const url = metadata.imageUrls![i];
-      const res = await fetch(url);
+      const imgUrl = urls[i];
+      let res: Response;
+      try {
+        res = await fetch(imgUrl);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        throw new Error(`Failed to download image ${i + 1} of ${total}: ${msg}`);
+      }
+
+      if (!res.ok) {
+        throw new Error(`Failed to download image ${i + 1} (HTTP status ${res.status}).`);
+      }
+
       const blob = await res.blob();
-      const ext = blob.type.split('/')[1] || 'jpg';
+      const rawExt = blob.type.split('/')[1] || 'jpg';
+      const ext = rawExt.includes('jpeg') ? 'jpg' : rawExt;
+
       images.push({
         filename: `${String(i + 1).padStart(3, '0')}.${ext}`,
         blob,
-        mimeType: blob.type,
+        mimeType: blob.type || 'image/jpeg',
       });
 
       if (onProgress) {

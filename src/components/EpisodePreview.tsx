@@ -1,18 +1,20 @@
 import React from 'react';
 import { ParsedTappytoonUrl, formatSeriesTitle } from '../services/tappytoonUrl';
 import { EpisodeMetadata } from '../services/tappytoonAdapter';
-import { CheckCircle2, AlertTriangle, Lock, Globe, Image as ImageIcon } from 'lucide-react';
+import { CheckCircle2, AlertTriangle, Lock, Globe, Image as ImageIcon, LogIn } from 'lucide-react';
 
 interface EpisodePreviewProps {
   parsedUrl: ParsedTappytoonUrl;
   metadata?: EpisodeMetadata;
   isLoading?: boolean;
+  onPromptLogin?: () => void;
 }
 
 export const EpisodePreview: React.FC<EpisodePreviewProps> = ({
   parsedUrl,
   metadata,
   isLoading = false,
+  onPromptLogin,
 }) => {
   if (!parsedUrl.isValid) {
     if (parsedUrl.error) {
@@ -76,6 +78,20 @@ export const EpisodePreview: React.FC<EpisodePreviewProps> = ({
           {metadata?.accessMessage && (
             <p className="text-xs text-slate-400 pt-1 leading-relaxed">{metadata.accessMessage}</p>
           )}
+
+          {metadata?.accessStatus === 'login_required' && onPromptLogin && (
+            <div className="pt-2">
+              <button
+                type="button"
+                onClick={onPromptLogin}
+                className="inline-flex items-center space-x-1.5 bg-rose-600 hover:bg-rose-500 text-white font-medium px-3 py-1.5 rounded-lg text-xs transition-colors shadow"
+              >
+                <LogIn className="w-3.5 h-3.5" />
+                <span>Log In to Access Episode</span>
+              </button>
+            </div>
+          )}
+
           {metadata?.extractionNote && (
             <p className="text-xs text-amber-400/90 pt-0.5 italic">{metadata.extractionNote}</p>
           )}

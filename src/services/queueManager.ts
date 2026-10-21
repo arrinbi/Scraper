@@ -1,5 +1,6 @@
 import { parseTappytoonUrl } from './tappytoonUrl';
 import { TappytoonAdapter } from './tappytoonAdapter';
+import { TappytoonAuthService } from './tappytoonAuth';
 import {
   QueueItemRecord,
   saveQueueItem,
@@ -53,7 +54,16 @@ export class QueueManager {
       throw new Error(`This episode is already in the queue (Status: ${existing.status}).`);
     }
 
-    const metadata = await TappytoonAdapter.fetchMetadata(parsed);
+    const token = TappytoonAuthService.getAccessToken();
+    const metadata = await TappytoonAdapter.fetchMetadata(parsed, token || undefined);
+
+    if (metadata.accessStatus === 'login_required') {
+      throw new Error('Authentication required to access this episode. Please log in to your Tappytoon account.');
+    }
+
+    if (metadata.accessStatus === 'purchase_required') {
+      throw new Error('This episode requires purchase or unlock on your Tappytoon account.');
+    }
 
     const newItem: QueueItemRecord = {
       id: parsed.canonicalUrl,
@@ -100,18 +110,25 @@ export class QueueManager {
       await saveQueueItem(waitingItem);
       await this.notifyListeners();
 
-      const result = await TappytoonAdapter.extractImages(parsed, async (progress) => {
-        waitingItem.progress = Math.min(100, Math.max(10, progress));
-        waitingItem.updatedAt = Date.now();
-        await saveQueueItem(waitingItem);
-        await this.notifyListeners();
-      });
+      const token = TappytoonAuthService.getAccessToken();
+      const result = await TappytoonAdapter.extractImages(
+        parsed,
+        async (progress) => {
+          waitingItem.progress = Math.min(100, Math.max(10, progress));
+          waitingItem.updatedAt = Date.now();
+          await saveQueueItem(waitingItem);
+          await this.notifyListeners();
+        },
+        token || undefined
+      );
 
       await saveItemImages(waitingItem.id, result.images);
 
       waitingItem.status = 'Completed';
       waitingItem.progress = 100;
       waitingItem.imageCount = result.images.length;
+      if (result.metadata.seriesTitle) waitingItem.seriesTitle = result.metadata.seriesTitle;
+      if (result.metadata.episodeTitle) waitingItem.episodeTitle = result.metadata.episodeTitle;
       waitingItem.errorMessage = undefined;
       waitingItem.updatedAt = Date.now();
       await saveQueueItem(waitingItem);

@@ -1,11 +1,13 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { Header } from './components/Header';
 import { UrlInput } from './components/UrlInput';
 import { EpisodePreview } from './components/EpisodePreview';
 import { QueueList } from './components/QueueList';
 import { IntegrationInfo } from './components/IntegrationInfo';
+import { LoginModal } from './components/LoginModal';
 import { parseTappytoonUrl, ParsedTappytoonUrl } from './services/tappytoonUrl';
 import { TappytoonAdapter, EpisodeMetadata } from './services/tappytoonAdapter';
+import { TappytoonAuthService, AuthUser } from './services/tappytoonAuth';
 import { QueueManager } from './services/queueManager';
 import { QueueItemRecord } from './services/db';
 
@@ -18,6 +20,12 @@ export default function App() {
   const [queueItems, setQueueItems] = useState<QueueItemRecord[]>([]);
   const [alertError, setAlertError] = useState<string | null>(null);
 
+  // Authentication states
+  const [isLoggedIn, setIsLoggedIn] = useState<boolean>(() => TappytoonAuthService.isLoggedIn());
+  const [user, setUser] = useState<AuthUser | null>(() => TappytoonAuthService.getUser());
+  const [isLoginModalOpen, setIsLoginModalOpen] = useState<boolean>(false);
+  const [pendingUrl, setPendingUrl] = useState<string | undefined>(undefined);
+
   const queueManager = QueueManager.getInstance();
 
   useEffect(() => {
@@ -27,15 +35,15 @@ export default function App() {
     return () => unsubscribe();
   }, [queueManager]);
 
-  useEffect(() => {
-    if (!url.trim()) {
+  const loadPreview = useCallback((inputUrl: string) => {
+    if (!inputUrl.trim()) {
       setParsedUrl({ isValid: false, rawUrl: '' });
       setMetadata(undefined);
       setAlertError(null);
       return;
     }
 
-    const parsed = parseTappytoonUrl(url);
+    const parsed = parseTappytoonUrl(inputUrl);
     setParsedUrl(parsed);
     setAlertError(null);
 
@@ -48,7 +56,11 @@ export default function App() {
     } else {
       setMetadata(undefined);
     }
-  }, [url]);
+  }, []);
+
+  useEffect(() => {
+    loadPreview(url);
+  }, [url, loadPreview]);
 
   const handlePaste = async () => {
     try {
@@ -72,6 +84,13 @@ export default function App() {
 
   const handleScrape = async () => {
     if (!url) return;
+
+    if (metadata?.accessStatus === 'login_required' && !isLoggedIn) {
+      setPendingUrl(url);
+      setIsLoginModalOpen(true);
+      return;
+    }
+
     setIsSubmitting(true);
     setAlertError(null);
     try {
@@ -79,15 +98,55 @@ export default function App() {
       handleClear();
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      setAlertError(msg);
+      if (msg.includes('Authentication required') || msg.includes('log in')) {
+        setPendingUrl(url);
+        setIsLoginModalOpen(true);
+      } else {
+        setAlertError(msg);
+      }
     } finally {
       setIsSubmitting(false);
     }
   };
 
+  const handleLogout = () => {
+    TappytoonAuthService.logout();
+    setIsLoggedIn(false);
+    setUser(null);
+    if (url) {
+      loadPreview(url);
+    }
+  };
+
+  const handleLoginSuccess = async () => {
+    setIsLoggedIn(true);
+    setUser(TappytoonAuthService.getUser());
+
+    const targetUrl = pendingUrl || url;
+    if (targetUrl) {
+      setIsSubmitting(true);
+      setAlertError(null);
+      try {
+        await queueManager.addToQueue(targetUrl);
+        setPendingUrl(undefined);
+        handleClear();
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        setAlertError(msg);
+      } finally {
+        setIsSubmitting(false);
+      }
+    }
+  };
+
   return (
     <div className="min-h-screen bg-slate-900 text-slate-100 flex flex-col font-sans selection:bg-rose-500 selection:text-white">
-      <Header />
+      <Header
+        isLoggedIn={isLoggedIn}
+        user={user}
+        onOpenLogin={() => setIsLoginModalOpen(true)}
+        onLogout={handleLogout}
+      />
 
       <main className="flex-1 max-w-4xl w-full mx-auto p-4 sm:p-6 space-y-6">
         {alertError && (
@@ -112,7 +171,15 @@ export default function App() {
         />
 
         {url.trim().length > 0 && (
-          <EpisodePreview parsedUrl={parsedUrl} metadata={metadata} isLoading={isPreviewLoading} />
+          <EpisodePreview
+            parsedUrl={parsedUrl}
+            metadata={metadata}
+            isLoading={isPreviewLoading}
+            onPromptLogin={() => {
+              setPendingUrl(url);
+              setIsLoginModalOpen(true);
+            }}
+          />
         )}
 
         <QueueList
@@ -123,6 +190,16 @@ export default function App() {
 
         <IntegrationInfo />
       </main>
+
+      <LoginModal
+        isOpen={isLoginModalOpen}
+        onClose={() => {
+          setIsLoginModalOpen(false);
+          setPendingUrl(undefined);
+        }}
+        onSuccess={handleLoginSuccess}
+        pendingUrl={pendingUrl}
+      />
 
       <footer className="py-4 text-center text-xs text-slate-500 border-t border-slate-800">
         Tappytoon Scraper Web App • Responsive Android & Desktop Interface
